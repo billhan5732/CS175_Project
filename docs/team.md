@@ -10,7 +10,7 @@ title:  Team
 ***UCI Net ID***: ucinetid1
 
 ## USER 2
-***UCI Net ID***: ucinetid2
+***UCI Net ID***: ivantp
 
 ## Bill Han
 ***UCI Net ID***: billh5
