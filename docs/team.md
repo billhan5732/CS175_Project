@@ -12,5 +12,5 @@ title:  Team
 ## USER 2
 ***UCI Net ID***: ucinetid2
 
-## USER 3
-***UCI Net ID***: ucinetid3
+## Bill Han
+***UCI Net ID***: billh5
