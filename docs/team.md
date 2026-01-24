@@ -6,10 +6,10 @@ title:  Team
 # {{ page.title }}
 
 
-## USER 1
+## TianJuan Ruan
 ***UCI Net ID***: tianjuar
 
-## USER 2
+## Ivan Thien Pham
 ***UCI Net ID***: ivantp
 
 ## Bill Han
