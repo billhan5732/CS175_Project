@@ -40,3 +40,11 @@ We will evaluate our model based on a few key metrics:
 - Speed/Lap Time
 - Staying on Track
 - Track Progress (not idling for too long)
+
+
+## Meetings
+Jan 23rd, 2026 3:45pm - First meeting on zoom.
+
+
+## AI Tool Usage
+No AI Tool has been utilzied so far.
