@@ -4,7 +4,7 @@ import random
 import math
 import time
 
-from ice_track_test import create_varied_environments
+from ice_track_testing import create_varied_environments
 
 import gym
 from stable_baselines3 import PPO
