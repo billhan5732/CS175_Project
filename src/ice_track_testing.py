@@ -4,6 +4,10 @@ import random
 import math
 import time
 
+from stable_baselines3 import PPO
+
+print("PPO imported successfully!")
+
 
 def generate_star_polygon(num_points=12, inner_radius=25, outer_radius=55, center=(50, 50)):
     """
@@ -84,12 +88,14 @@ def generate_bridge_connections(vertices, vertex_types, start_vertex_idx, bridge
     return bridges
 
 
-def get_skipped_edges(bridges, num_vertices):
+def get_skipped_edges_and_verts(bridges, num_vertices):
     """
     Determine which edges should be skipped because a bridge replaces them
     Returns a set of edge tuples to skip
     """
     skipped_edges = set()
+
+    skipped_verts = set()
 
     for start_idx, end_idx in bridges:
         # When we bridge from vertex i to vertex i+2, we skip edges:
@@ -106,7 +112,9 @@ def get_skipped_edges(bridges, num_vertices):
             skipped_edges.add(edge1)
             skipped_edges.add(edge2)
 
-    return skipped_edges
+            skipped_verts.add(middle_idx)
+
+    return skipped_edges, skipped_verts
 
 
 def interpolate_track_segment(start, end, track_width=8):
@@ -183,13 +191,13 @@ def generate_star_race_track(num_points=12, min_width=6, max_width=16, bridge_pr
     vertices, vertex_types = generate_star_polygon(num_points)
 
     # Choose a random starting vertex
-    start_vertex_idx = random.randint(0, len(vertices) - 1)
+    start_vertex_idx = 0
 
     # Generate bridge connections by walking the polygon
     bridges = generate_bridge_connections(vertices, vertex_types, start_vertex_idx, bridge_probability)
 
     # Determine which edges to skip
-    skipped_edges = get_skipped_edges(bridges, len(vertices))
+    skipped_edges, skipped_verts = get_skipped_edges_and_verts(bridges, len(vertices))
 
     xml_blocks = []
     all_track_positions = set()
@@ -259,6 +267,9 @@ def generate_star_race_track(num_points=12, min_width=6, max_width=16, bridge_pr
     # 5. Place checkpoints (goals) at vertices
     checkpoint_positions = []
     for i, (x, z) in enumerate(vertices):
+
+        if i in skipped_verts:
+            continue
         checkpoint_positions.append((x, z))
 
         # Make starting checkpoint a different color (emerald block)
@@ -267,9 +278,9 @@ def generate_star_race_track(num_points=12, min_width=6, max_width=16, bridge_pr
         # Draw a 3x3 area of blocks at each vertex
         for dx in range(-1, 2):
             for dz in range(-1, 2):
-                xml_blocks.append(f'<DrawBlock x="{x + dx}" y="227" z="{z + dz}" type="{block_type}"/>')
+                xml_blocks.append(f'<DrawBlock x="{x + dx}" y="229" z="{z + dz}" type="{block_type}"/>')
                 # Make checkpoint taller so it's visible
-                xml_blocks.append(f'<DrawBlock x="{x + dx}" y="228" z="{z + dz}" type="{block_type}"/>')
+                xml_blocks.append(f'<DrawBlock x="{x + dx}" y="230" z="{z + dz}" type="{block_type}"/>')
 
     # Use starting vertex position for spawn
     spawn_x, spawn_z = vertices[start_vertex_idx]
@@ -305,8 +316,8 @@ def create_mission_xml(track_xml, spawn_point, seed=None):
                 <FlatWorldGenerator generatorString="3;7,220*1,5*3,2;3;,biome_1"/>
                 <DrawingDecorator>
                     <!-- Clear the area first -->
-                    <DrawCuboid x1="-50" y1="225" z1="-50" x2="150" y2="230" z2="150" type="air"/>
-                    <DrawCuboid x1="-50" y1="226" z1="-50" x2="150" y2="226" z2="150" type="grass"/>
+                    <DrawCuboid x1="-50" y1="225" z1="-50" x2="150" y2="255" z2="150" type="air"/>
+                    <DrawCuboid x1="-50" y1="224" z1="-50" x2="150" y2="224" z2="150" type="lava"/>
 
                     {track_xml}
                     <!-- Spawn boat at starting checkpoint -->
@@ -317,13 +328,27 @@ def create_mission_xml(track_xml, spawn_point, seed=None):
             </ServerHandlers>
         </ServerSection>
 
-        <AgentSection mode="Spectator">
+        <AgentSection mode="Survival">
             <Name>IceBoatRacer</Name>
             <AgentStart>
-                <Placement x="{spawn_x}" y="280" z="{spawn_z}" pitch="90" yaw="0"/>
+                <Placement x="{spawn_x}" y="227" z="{spawn_z}" pitch="90" yaw="0"/>
             </AgentStart>
             <AgentHandlers>
                 <ObservationFromFullStats/>
+                <ObservationFromNearbyEntities>
+                    <Range name="entities" xrange="10" yrange="2" zrange="10" />
+                </ObservationFromNearbyEntities>
+                <ObservationFromGrid>
+                    <Grid name="nearby_blocks">
+                        <min x="-3" y="-1" z="-3"/>
+                        <max x="3" y="1" z="3"/>
+                    </Grid>
+                </ObservationFromGrid>
+
+                <HumanLevelCommands/>
+
+
+
             </AgentHandlers>
         </AgentSection>
     </Mission>'''
@@ -407,11 +432,6 @@ if __name__ == "__main__":
     print("Press CTRL+C to exit.")
 
     # Keep the mission running
-    try:
-        while world_state.is_mission_running:
-            time.sleep(0.1)
-            world_state = agent_host.getWorldState()
-    except KeyboardInterrupt:
-        print("\nMission interrupted.")
-
-    print("Mission ended.")
+    # try:
+    #    while world_state.is_mission_running:
+    #        time.sleep(0.1)
