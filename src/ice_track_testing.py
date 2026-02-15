@@ -8,6 +8,8 @@ from stable_baselines3 import PPO
 
 print("PPO imported successfully!")
 
+RESET_BLOCK_TYPE = "lava"
+
 
 def generate_star_polygon(num_points=12, inner_radius=25, outer_radius=55, center=(50, 50)):
     """
@@ -288,6 +290,227 @@ def generate_star_race_track(num_points=12, min_width=6, max_width=16, bridge_pr
     return "\n".join(xml_blocks), checkpoint_positions, segment_widths, bridges, (spawn_x, spawn_z), start_vertex_idx
 
 
+def generate_star_race_track_with_offset(num_points=12, min_width=6, max_width=16, bridge_probability=0.3, offset_x=0):
+    """
+    Generate a star-shaped race track with optional X offset applied during generation
+    Much faster than parsing XML after the fact
+    """
+
+    # Generate star vertices with offset already applied
+    vertices, vertex_types = generate_star_polygon(num_points)
+
+    # Apply offset to vertices immediately
+    vertices = [(x + offset_x, z) for x, z in vertices]
+
+    # Choose a random starting vertex
+    start_vertex_idx = 0
+
+    # Generate bridge connections by walking the polygon
+    bridges = generate_bridge_connections(vertices, vertex_types, start_vertex_idx, bridge_probability)
+
+    # Determine which edges to skip
+    skipped_edges, skipped_verts = get_skipped_edges_and_verts(bridges, len(vertices))
+
+    xml_blocks = []
+    all_track_positions = set()
+    segment_widths = []
+
+    # Track the width of edges connected to each vertex
+    vertex_edge_widths = {i: [] for i in range(len(vertices))}
+
+    # 1. Generate main perimeter track segments (excluding skipped edges)
+    for i in range(len(vertices)):
+        start_idx = i
+        end_idx = (i + 1) % len(vertices)
+
+        # Check if this edge should be skipped
+        edge = tuple(sorted([start_idx, end_idx]))
+        if edge in skipped_edges:
+            continue
+
+        start = vertices[start_idx]
+        end = vertices[end_idx]
+
+        # Randomize width for this segment
+        segment_width = random.randint(min_width, max_width)
+        segment_widths.append(segment_width)
+
+        # Track widths for each vertex
+        vertex_edge_widths[start_idx].append(segment_width)
+        vertex_edge_widths[end_idx].append(segment_width)
+
+        segment_blocks = interpolate_track_segment(start, end, segment_width)
+        all_track_positions.update(segment_blocks)
+
+    # 2. Generate bridge segments (shortcuts)
+    bridge_widths = []
+    for start_idx, end_idx in bridges:
+        start = vertices[start_idx]
+        end = vertices[end_idx]
+
+        bridge_width = random.randint(min_width, max_width)
+        bridge_widths.append(bridge_width)
+
+        vertex_edge_widths[start_idx].append(bridge_width)
+        vertex_edge_widths[end_idx].append(bridge_width)
+
+        bridge_blocks = interpolate_track_segment(start, end, bridge_width)
+        all_track_positions.update(bridge_blocks)
+
+    # 3. Add circular ice patches at each vertex
+    for i, vertex in enumerate(vertices):
+        if vertex_edge_widths[i]:
+            min_edge_width = min(vertex_edge_widths[i])
+            circle_radius = min_edge_width // 2
+            circle_blocks = generate_vertex_circle(vertex, circle_radius)
+            all_track_positions.update(circle_blocks)
+
+    # 4. Draw all ice blocks
+    for x, z in all_track_positions:
+        xml_blocks.append(f'<DrawBlock x="{x}" y="226" z="{z}" type="packed_ice"/>')
+        xml_blocks.append(f'<DrawBlock x="{x}" y="227" z="{z}" type="air"/>')
+        xml_blocks.append(f'<DrawBlock x="{x}" y="228" z="{z}" type="air"/>')
+
+    # 5. Place checkpoints (goals) at vertices
+    checkpoint_positions = []
+    for i, (x, z) in enumerate(vertices):
+        if i in skipped_verts:
+            continue
+        checkpoint_positions.append((x, z))
+
+        block_type = "emerald_block" if i == start_vertex_idx else "gold_block"
+
+        for dx in range(-1, 2):
+            for dz in range(-1, 2):
+                xml_blocks.append(f'<DrawBlock x="{x + dx}" y="229" z="{z + dz}" type="{block_type}"/>')
+                xml_blocks.append(f'<DrawBlock x="{x + dx}" y="230" z="{z + dz}" type="{block_type}"/>')
+
+    # Use starting vertex position for spawn
+    spawn_x, spawn_z = vertices[start_vertex_idx]
+
+    return "\n".join(xml_blocks), checkpoint_positions, segment_widths, bridges, (spawn_x, spawn_z), start_vertex_idx
+
+
+def create_combined_tracks_mission(num_tracks=5, track_x_spacing=200):
+    """
+    Generate multiple tracks at different X positions in a single mission.
+    Much faster version - applies offset during generation instead of parsing XML
+    """
+    all_tracks_drawing = []
+    tracks_data = []
+
+    # Generate each track with offset applied during generation
+    for i in range(num_tracks):
+        offset_x = i * track_x_spacing
+
+        # Generate track with varied parameters
+        num_points = random.choice([8, 10, 12, 14, 16])
+        min_width = random.randint(5, 8)
+        max_width = random.randint(12, 20)
+        bridge_prob = random.uniform(0.3, 0.6)
+
+        # Generate track with offset already applied - much faster!
+        track_xml, cp_pos, seg_widths, bridges, spawn, start_idx = generate_star_race_track_with_offset(
+            num_points=num_points,
+            min_width=min_width,
+            max_width=max_width,
+            bridge_probability=bridge_prob,
+            offset_x=offset_x  # Apply offset during generation
+        )
+
+        all_tracks_drawing.append(track_xml)
+
+        tracks_data.append({
+            'checkpoints': cp_pos,  # Already offsetted
+            'spawn_point': spawn,  # Already offsetted
+            'segment_widths': seg_widths,
+            'bridges': bridges,
+            'start_vertex_idx': start_idx,
+            'offset_x': offset_x,
+            'track_xml': track_xml,
+            'difficulty': {
+                'num_points': num_points,
+                'min_width': min_width,
+                'max_width': max_width,
+                'num_bridges': len(bridges)
+            }
+        })
+
+    # Get first spawn for initial placement
+    first_spawn_x, first_spawn_z = tracks_data[0]['spawn_point']
+
+    # Calculate world bounds
+    max_x = num_tracks * track_x_spacing + 150
+
+    # Build combined mission XML
+    combined_track_xml = "\n".join(all_tracks_drawing)
+
+    mission_xml = f'''<?xml version="1.0" encoding="UTF-8" standalone="no" ?>
+    <Mission xmlns="http://ProjectMalmo.microsoft.com" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+        <About>
+            <Summary>Ice Boat Racing Training - All Tracks Combined</Summary>
+        </About>
+
+        <ServerSection>
+            <ServerInitialConditions>
+                <Time>
+                    <StartTime>6000</StartTime>
+                    <AllowPassageOfTime>false</AllowPassageOfTime>
+                </Time>
+                <Weather>clear</Weather>
+                <AllowSpawning>false</AllowSpawning>
+            </ServerInitialConditions>
+            <ServerHandlers>
+                <FlatWorldGenerator generatorString="3;7,220*1,5*3,2;3;,biome_1"/>
+                <DrawingDecorator>
+                    <!-- Clear large area for all tracks -->
+                    <DrawCuboid x1="-50" y1="225" z1="-150" x2="{max_x}" y2="255" z2="150" type="air"/>
+                    <DrawCuboid x1="-50" y1="225" z1="-150" x2="{max_x}" y2="225" z2="150" type="{RESET_BLOCK_TYPE}"/>
+
+                    {combined_track_xml}
+                </DrawingDecorator>
+            </ServerHandlers>
+        </ServerSection>
+
+        <AgentSection mode="Creative">
+            <Name>IceBoatRacer</Name>
+            <AgentStart>
+                <Placement x="{first_spawn_x}" y="227" z="{first_spawn_z}" pitch="0" yaw="0"/>
+            </AgentStart>
+            <AgentHandlers>
+                <ObservationFromFullStats/>
+                <ObservationFromNearbyEntities>
+                    <Range name="entities" xrange="10" yrange="2" zrange="10" />
+                </ObservationFromNearbyEntities>
+                <ObservationFromGrid>
+                    <Grid name="nearby_blocks">
+                        <min x="-3" y="-1" z="-3"/>
+                        <max x="3" y="1" z="3"/>
+                    </Grid>
+                </ObservationFromGrid>
+
+                <HumanLevelCommands/>
+                <ChatCommands/>
+                <AbsoluteMovementCommands>
+                    <ModifierList type="allow-list">
+                        <command>tp</command>
+                        <command>setYaw</command>
+                        <command>setPitch</command>
+                    </ModifierList>
+                </AbsoluteMovementCommands>
+                <AgentQuitFromReachingCommandQuota total="0"/>
+            </AgentHandlers>
+        </AgentSection>
+    </Mission>'''
+
+    return {
+        'mission_xml': mission_xml,
+        'tracks': tracks_data,
+        'num_tracks': num_tracks,
+        'track_spacing': track_x_spacing
+    }
+
+
 def create_mission_xml(track_xml, spawn_point, seed=None):
     """
     Create the full mission XML with the generated track
@@ -317,18 +540,19 @@ def create_mission_xml(track_xml, spawn_point, seed=None):
                 <DrawingDecorator>
                     <!-- Clear the area first -->
                     <DrawCuboid x1="-50" y1="225" z1="-50" x2="150" y2="255" z2="150" type="air"/>
-                    <DrawCuboid x1="-50" y1="224" z1="-50" x2="150" y2="224" z2="150" type="lava"/>
+                    <DrawCuboid x1="-50" y1="225" z1="-50" x2="150" y2="224" z2="150" type="lava"/>
 
                     {track_xml}
                     <!-- Spawn boat at starting checkpoint -->
                     <DrawEntity x="{spawn_x}" y="227" z="{spawn_z}" type="Boat"/>
                 </DrawingDecorator>
-                <ServerQuitFromTimeUp timeLimitMs="120000"/>
-                <ServerQuitWhenAnyAgentFinishes/>
+                <!-- <ServerQuitFromTimeUp timeLimitMs="120000"/> -->
+                <!-- REMOVE OR COMMENT OUT ServerQuitWhenAnyAgentFinishes -->
+                <!-- <ServerQuitWhenAnyAgentFinishes/> -->
             </ServerHandlers>
         </ServerSection>
 
-        <AgentSection mode="Survival">
+        <AgentSection mode="Creative">
             <Name>IceBoatRacer</Name>
             <AgentStart>
                 <Placement x="{spawn_x}" y="227" z="{spawn_z}" pitch="90" yaw="0"/>
@@ -346,6 +570,16 @@ def create_mission_xml(track_xml, spawn_point, seed=None):
                 </ObservationFromGrid>
 
                 <HumanLevelCommands/>
+                <ChatCommands/>
+                <AbsoluteMovementCommands>
+                    <ModifierList type="allow-list">
+                        <command>tp</command>
+                        <command>setYaw</command>
+                        <command>setPitch</command>
+                    </ModifierList>
+                </AbsoluteMovementCommands>
+                <MissionQuitCommands/>
+                <AgentQuitFromReachingCommandQuota total="0"/>
 
 
 
