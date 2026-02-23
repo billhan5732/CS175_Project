@@ -3,8 +3,9 @@ import json
 import random
 import math
 import time
+import sys
 
-from ice_track_testing import create_varied_environments, create_combined_tracks_mission, RESET_BLOCK_TYPE
+from ice_track_testing import create_combined_tracks_mission, RESET_BLOCK_TYPE
 
 import gym
 from stable_baselines3 import PPO
@@ -13,7 +14,6 @@ from gym import spaces
 import numpy as np
 
 TICK_LENGTH = 0.05
-CHECK_POINT_SKIP_ALLOWED = False
 TESTING = False
 
 print("imported successfully!")
@@ -32,16 +32,21 @@ class MalmoBoatEnv(gym.Env):
         # [dx_to_checkpoint1, dz_to_checkpoint1,
         #  dx_to_checkpoint2, dz_to_checkpoint2,
         #  dx_to_checkpoint3, dz_to_checkpoint3,
-        #  velocity_x, velocity_z, yaw]
+        #  velocity_x, velocity_z, cos_angle_to_target, sin_angle_to_target]
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
-            shape=(9,),
+            shape=(10,),
             dtype=np.float32
         )
 
         # Malmo agent host
         self.agent_host = MalmoPython.AgentHost()
+        try:
+            self.agent_host.parse(sys.argv)
+        except RuntimeError as e:
+            print(f'ERROR parsing agent arguments: {e}')
+            print(self.agent_host.getUsage())
 
         # Generate combined mission with all tracks
         combined_data = create_combined_tracks_mission(num_tracks=5, track_x_spacing=200)
@@ -54,7 +59,7 @@ class MalmoBoatEnv(gym.Env):
 
         # Track switching
         self.episodes_on_current_track = 0
-        self.episodes_per_track = 2  # Switch track every 10 episodes
+        self.episodes_per_track = 2  # Switch track every 2 episodes
 
         # Mission state
         self._mission_running = False
@@ -67,7 +72,13 @@ class MalmoBoatEnv(gym.Env):
         self.num_check_points = 0
         self.prev_dist = None
 
+        # Store last raw observation for reward computation
+        self.last_raw_obs = None
+
         self.reset_block_type = RESET_BLOCK_TYPE
+
+        # Checkpoint detection threshold
+        self.checkpoint_threshold = 5.0  # 5 blocks radius
 
     def _get_current_track_info(self):
         """Get spawn point and checkpoints for current track"""
@@ -78,19 +89,18 @@ class MalmoBoatEnv(gym.Env):
         """Check if episode should terminate"""
         # All checkpoints reached
         if self.current_target_checkpoint_idx >= len(self.checkpoints):
+            print("All checkpoints reached!")
             return True
 
-        # Check if agent is in lava (manual detection since Creative mode doesn't die)
-        if world_state.number_of_observations_since_last_state > 0:
-            msg = world_state.observations[-1].text
-            observation = json.loads(msg)
-
-            # Check if touching lava
-            if self._is_in_lava(observation):
+        # Check if agent is in lava using coordinates
+        if self.last_raw_obs is not None:
+            if self._is_in_lava_coords(self.last_raw_obs):
+                print("Fell into lava! Resetting...")
                 return True
 
         # Mission ended unexpectedly - need full restart
         if not world_state.is_mission_running:
+            print("Mission not running!")
             self._mission_needs_restart = True
             return True
 
@@ -130,18 +140,14 @@ class MalmoBoatEnv(gym.Env):
         return self._get_observation()
 
     def tpToTrackSpawnAndSpawnBoat(self):
-
         spawn_x, spawn_z = self.spawn_point
 
         for key in ["forward", "back", "left", "right"]:
             self.agent_host.sendCommand(f"{key} 0")
         time.sleep(TICK_LENGTH * 10)
 
-
-
         # Teleport to spawn
         self.agent_host.sendCommand(f"tp {spawn_x} 230 {spawn_z}")
-        #self.agent_host.sendCommand("chat /kill @e[type=boat]")
         for key in ["forward", "back", "left", "right"]:
             self.agent_host.sendCommand(f"{key} 0")
         time.sleep(TICK_LENGTH * 10)
@@ -201,7 +207,7 @@ class MalmoBoatEnv(gym.Env):
         self.current_target_checkpoint_idx = 1
         self.prev_dist = None
 
-        time.sleep(10)#load in wait time
+        time.sleep(10)  # load in wait time
 
         self.tpToTrackSpawnAndSpawnBoat()
 
@@ -213,9 +219,11 @@ class MalmoBoatEnv(gym.Env):
         """Execute one step in the environment"""
         throttle_action, steering_action = action
 
-        # Release all keys first
-        for key in ["forward", "back", "left", "right"]:
-            self.agent_host.sendCommand(f"{key} 0")
+        # CRITICAL: Release all keys MULTIPLE times to ensure commands clear
+        for _ in range(3):
+            for key in ["forward", "back", "left", "right"]:
+                self.agent_host.sendCommand(f"{key} 0")
+            time.sleep(0.01)
 
         # Throttle control (discrete)
         if throttle_action == 1:
@@ -223,23 +231,29 @@ class MalmoBoatEnv(gym.Env):
         elif throttle_action == 2:
             self.agent_host.sendCommand("back 1")
 
-        # Steering control (discrete)
-        if steering_action == 1:
-            self.agent_host.sendCommand("left 1")
-        elif steering_action == 2:
-            self.agent_host.sendCommand("right 1")
+        # Steering control (discrete) - only apply if throttle is active
+        # This prevents spinning in place
+        if throttle_action != 0:  # Only steer if moving
+            if steering_action == 1:
+                self.agent_host.sendCommand("left 1")
+            elif steering_action == 2:
+                self.agent_host.sendCommand("right 1")
 
         # Wait for physics to update
         time.sleep(TICK_LENGTH * 6)
+
+        # Clear commands again after action
+        for key in ["forward", "back", "left", "right"]:
+            self.agent_host.sendCommand(f"{key} 0")
 
         # Get current world state
         world_state = self.agent_host.getWorldState()
 
         # Get observations
-        obs = self._get_observation()
+        obs = self._get_observation(world_state)
 
-        # Compute reward
-        reward = self._compute_reward(obs, world_state)
+        # Compute reward using stored raw observation
+        reward = self._compute_reward()
 
         # Check if done
         done = self._check_done(world_state)
@@ -249,35 +263,44 @@ class MalmoBoatEnv(gym.Env):
             'checkpoint': self.current_target_checkpoint_idx,
             'total_checkpoints': len(self.checkpoints),
             'track_idx': self.current_track_idx,
-            'reason': None
         }
 
         return obs, reward, done, info
 
-    def _compute_reward(self, obs, world_state):
+    def _compute_reward(self):
         """Compute reward based on current state"""
         reward = 0.0
 
-        # Get current position from latest observation
-        if world_state.number_of_observations_since_last_state > 0:
-            msg = world_state.observations[-1].text
-            observation = json.loads(msg)
+        # Use stored raw observation
+        if self.last_raw_obs is not None:
+            observation = self.last_raw_obs
             x = observation.get('XPos', 0)
             y = observation.get('YPos', 0)
             z = observation.get('ZPos', 0)
 
-            # Check if agent died - heavy penalty (shouldn't happen in Creative)
-            is_alive = observation.get('IsAlive', True)
-            if not is_alive:
-                reward -= 1000.0
-                return reward
+            # Get yaw to detect spinning
+            yaw = observation.get('Yaw', 0)
+
+            # Track yaw changes to penalize spinning
+            if hasattr(self, 'last_yaw'):
+                yaw_change = abs(yaw - self.last_yaw)
+                # Normalize for wrap-around (359 -> 0)
+                if yaw_change > 180:
+                    yaw_change = 360 - yaw_change
+
+                # Penalize excessive turning (spinning in place)
+                if yaw_change > 30:  # More than 30 degrees per step
+                    reward -= yaw_change * 0.5  # Penalty proportional to spin
+
+            self.last_yaw = yaw
 
             # Check if touching lava - heavy penalty
-            if self._is_in_lava(observation):
+            if self._is_in_lava_coords(observation):
                 reward -= 1000.0
                 return reward
 
-            checkpoints_traveled = self._check_checkpoint_blocks(observation, x, y, z)
+            # Check checkpoint using coordinates
+            checkpoints_traveled = self._check_checkpoint_coords(x, y, z)
 
             # Large reward for checkpoints
             reward += 500.0 * checkpoints_traveled
@@ -296,7 +319,6 @@ class MalmoBoatEnv(gym.Env):
 
                 if self.prev_dist is not None:
                     reward += (self.prev_dist - dist) * 5.0
-                    #print(f"Progressed Distance To Next Checkpoint: {self.prev_dist - dist}")
                 self.prev_dist = dist
 
             # Small time penalty to encourage faster completion
@@ -304,115 +326,66 @@ class MalmoBoatEnv(gym.Env):
 
         return reward
 
-    def approximate_checkpoint_idx(self, block_x, block_z):
-        for checkpoint_idx in range(len(self.checkpoints)):
-            x_dist = (self.checkpoints[checkpoint_idx])[0] - block_x
-            z_dist = (self.checkpoints[checkpoint_idx])[1] - block_z
+    def _check_checkpoint_coords(self, agent_x, agent_y, agent_z):
+        """Check if agent is close to the next checkpoint using coordinates"""
 
-            if np.sqrt(x_dist ** 2 + z_dist ** 2) < 3:
-                return checkpoint_idx
-        return -1
+        # One-time debug on first call
+        if not hasattr(self, '_checkpoint_debug_done'):
+            self._checkpoint_debug_done = True
+            print(f"\nCheckpoint system initialized - Using coordinate-based detection")
+            print(f"Agent at ({agent_x:.1f}, {agent_y:.1f}, {agent_z:.1f})")
+            print(f"Next checkpoint at: {self.checkpoints[self.current_target_checkpoint_idx]}")
+            print(f"Detection threshold: {self.checkpoint_threshold} blocks\n")
 
-    def _check_checkpoint_blocks(self, observation, agent_x, agent_y, agent_z):
-        """Check if agent is passing under a checkpoint block (gold or emerald)"""
+        # Check if we're close to the next expected checkpoint
+        if self.current_target_checkpoint_idx < len(self.checkpoints):
+            expected = self.checkpoints[self.current_target_checkpoint_idx]
 
-        # Get the grid data
-        if 'nearby_blocks' not in observation:
-            return 0
+            # Calculate horizontal distance to checkpoint
+            checkpoint_dist = np.sqrt((expected[0] - agent_x) ** 2 + (expected[1] - agent_z) ** 2)
 
-        grid = observation.get('nearby_blocks', [])
-
-        # Grid dimensions from mission XML: min=(-3,-1,-3), max=(3,1,3)
-        # This creates a 7x3x7 grid
-        idx = 0
-        for y_offset in range(-1, 2):  # -1, 0, 1
-            for z_offset in range(-3, 4):  # -3 to 3
-                for x_offset in range(-3, 4):  # -3 to 3
-                    if idx >= len(grid):
-                        break
-
-                    block_type = grid[idx]
-                    idx += 1
-
-                    # Check for checkpoint blocks
-                    if block_type in ['gold_block', 'emerald_block']:
-                        # Calculate actual block position
-                        bx = agent_x + x_offset
-                        by = agent_y + y_offset
-                        bz = agent_z + z_offset
-
-                        # Check if block is ~2 blocks above agent and horizontally aligned
-                        horizontal_dist = np.sqrt(x_offset ** 2 + z_offset ** 2)
-
-                        # Block should be 2 blocks above and agent should be roughly under it
-                        if 1.5 < (by - agent_y) < 2.5 and horizontal_dist < 1.5:
-                            if CHECK_POINT_SKIP_ALLOWED:
-                                checkpoint_id = self.approximate_checkpoint_idx(int(bx), int(bz))
-                                if checkpoint_id < 0:
-                                    continue
-
-                                forward_dist = (
-                                                       checkpoint_id - self.current_target_checkpoint_idx + self.num_check_points
-                                               ) % self.num_check_points
-
-                                # Allow skipping 1 checkpoint, but penalize larger skips or backward movement
-                                if forward_dist == 0:
-                                    return 0  # Same checkpoint, no reward
-                                elif forward_dist <= 2:  # Next checkpoint or skip one
-                                    return forward_dist
-                                else:  # Going backward
-                                    return -forward_dist
-                            else:
-                                # Verify this is the NEXT checkpoint we're expecting
-                                if self.current_target_checkpoint_idx < len(self.checkpoints):
-                                    expected = self.checkpoints[self.current_target_checkpoint_idx]
-                                    checkpoint_dist = np.sqrt((expected[0] - bx) ** 2 + (expected[1] - bz) ** 2)
-
-                                    # Make sure this block is at the expected checkpoint location
-                                    if checkpoint_dist < 1.0:
-                                        return 1
+            # If within threshold distance of checkpoint, count it as reached
+            if checkpoint_dist < self.checkpoint_threshold:
+                print(f"Reached checkpoint {self.current_target_checkpoint_idx}! Distance: {checkpoint_dist:.2f}")
+                return 1
 
         return 0
 
-    def _is_in_lava(self, observation):
-        """Check if the boat is in/touching lava"""
+    def _is_in_lava_coords(self, observation):
+        """Check if the boat is in lava using Y coordinate"""
+        y = observation.get('YPos', 227)
 
-        if 'nearby_blocks' not in observation:
-            return False
-
-        grid = observation.get('nearby_blocks', [])
-
-        # Grid dimensions from mission XML
-        idx = 0
-        for y_offset in range(-1, 2):  # -1, 0, 1
-            for z_offset in range(-3, 4):  # -3 to 3
-                for x_offset in range(-3, 4):  # -3 to 3
-                    if idx >= len(grid):
-                        break
-
-                    block_type = grid[idx]
-                    idx += 1
-
-                    if block_type in ['lava', 'flowing_lava', self.reset_block_type]:
-                        # Check if lava is very close (boat is touching/in it)
-                        if abs(x_offset) < 1.0 and abs(y_offset) < 1.0 and abs(z_offset) < 1.0:
-                            return True
+        # If boat has fallen below ice level (y=226), it's in lava
+        # Normal boat position is y=227 (on ice)
+        if y < 226.5:
+            return True
 
         return False
 
-    def _get_observation(self):
+    def _get_observation(self, world_state=None):
         """Get current observation from Malmo"""
-        world_state = self.agent_host.getWorldState()
+        if world_state is None:
+            world_state = self.agent_host.getWorldState()
 
         if world_state.number_of_observations_since_last_state > 0:
             msg = world_state.observations[-1].text
             observation = json.loads(msg)
 
+            # Store raw observation for reward computation
+            self.last_raw_obs = observation
+
             x = observation.get('XPos', 0)
             z = observation.get('ZPos', 0)
             vx = observation.get('XVel', 0)
             vz = observation.get('ZVel', 0)
+
+            # Try to get boat yaw from nearby entities, fall back to agent yaw
             yaw = observation.get('Yaw', 0)
+            if 'entities' in observation:
+                for entity in observation['entities']:
+                    if entity.get('name') == 'Boat':
+                        yaw = entity.get('yaw', yaw)
+                        break
 
             # Get next 3 checkpoints (or as many as remain)
             obs_values = []
@@ -425,18 +398,58 @@ class MalmoBoatEnv(gym.Env):
                     dx = target[0] - x
                     dz = target[1] - z
                 else:
-                    # If no more checkpoints, use zeros
                     dx, dz = 0, 0
 
                 obs_values.extend([dx, dz])
 
-            # Add velocity and yaw
-            obs_values.extend([vx, vz, yaw])
+            # Add velocity
+            obs_values.extend([vx, vz])
+
+            # Compute relative angle to next checkpoint
+            if self.current_target_checkpoint_idx < len(self.checkpoints):
+                target = self.checkpoints[self.current_target_checkpoint_idx]
+                dx_to_target = target[0] - x
+                dz_to_target = target[1] - z
+
+                # Angle to target (in radians)
+                angle_to_target = math.atan2(dz_to_target, dx_to_target)
+
+                # Convert yaw to radians
+                yaw_radians = math.radians(-yaw + 90)
+
+                # Relative angle
+                relative_angle = angle_to_target - yaw_radians
+                relative_angle = math.atan2(math.sin(relative_angle), math.cos(relative_angle))
+
+                # Convert to cos/sin
+                cos_angle = math.cos(relative_angle)
+                sin_angle = math.sin(relative_angle)
+            else:
+                cos_angle = 1.0
+                sin_angle = 0.0
+
+            obs_values.extend([cos_angle, sin_angle])
 
             return np.array(obs_values, dtype=np.float32)
 
-        # Fallback if no observations yet
-        return np.zeros(9, dtype=np.float32)
+        # Fallback: use last known observation or zeros
+        # This is OK - we'll get fresh data on next step
+        if self.last_raw_obs is not None:
+            # Reuse last observation to construct state
+            x = self.last_raw_obs.get('XPos', 0)
+            z = self.last_raw_obs.get('ZPos', 0)
+            obs_values = []
+            for i in range(3):
+                checkpoint_idx = self.current_target_checkpoint_idx + i
+                if checkpoint_idx < len(self.checkpoints):
+                    target = self.checkpoints[checkpoint_idx]
+                    obs_values.extend([target[0] - x, target[1] - z])
+                else:
+                    obs_values.extend([0, 0])
+            obs_values.extend([0, 0, 1.0, 0.0])  # zero velocity, neutral angle
+            return np.array(obs_values, dtype=np.float32)
+
+        return np.zeros(10, dtype=np.float32)
 
     def close(self):
         """Clean up"""
@@ -451,7 +464,7 @@ if __name__ == "__main__" and not TESTING:
     # Create the environment
     env = MalmoBoatEnv()
 
-    # Create the PPO model with higher entropy for exploration
+    # Create the PPO model
     model = PPO(
         "MlpPolicy",
         env,
@@ -461,7 +474,7 @@ if __name__ == "__main__" and not TESTING:
         batch_size=64,
         n_epochs=10,
         gamma=0.99,
-        ent_coef=0.01,  # Entropy coefficient for exploration
+        ent_coef=0.01,
     )
 
     # Save checkpoints every 10000 steps
@@ -490,48 +503,5 @@ if __name__ == "__main__" and not TESTING:
         print(f"Latest checkpoint also available in ./models/ directory")
 
     finally:
-        # Clean up environment
         env.close()
         print("Environment closed.")
-
-if __name__ == "__main__":
-    # Generate 5 training environments
-    envs = create_varied_environments(5)
-
-    # Print info about the first environment
-    print(f"Generated star track with {len(envs[0]['checkpoints'])} checkpoints")
-    print(f"Starting vertex: {envs[0]['start_vertex_idx']} (marked with EMERALD)")
-    print(f"Number of bridge shortcuts: {len(envs[0]['bridges'])}")
-    print(f"Bridge connections: {envs[0]['bridges']}")
-
-    # Start a mission with the first environment
-    agent_host = MalmoPython.AgentHost()
-
-    my_mission = MalmoPython.MissionSpec(envs[0]['mission_xml'], True)
-    my_mission_record = MalmoPython.MissionRecordSpec()
-
-    # Launch the mission
-    try:
-        agent_host.startMission(my_mission, my_mission_record)
-    except RuntimeError as e:
-        print(f"Error starting mission: {e}")
-        exit(1)
-
-    # Wait for the mission to start
-    print("Waiting for mission to start...")
-    world_state = agent_host.getWorldState()
-    while not world_state.has_mission_begun:
-        time.sleep(0.1)
-        world_state = agent_host.getWorldState()
-
-    agent_host.sendCommand("use 1")
-    time.sleep(TICK_LENGTH)
-    agent_host.sendCommand("use 0")
-    time.sleep(TICK_LENGTH)
-    agent_host.sendCommand("moveMouse 0 500")
-
-    print("Mission started! Star track with bridge shortcuts - CONTINUOUS PATH!")
-    print("Camera positioned directly above, looking down.")
-    print("EMERALD block = starting checkpoint")
-    print("GOLD blocks = other checkpoints")
-    print("Press CTRL+C to exit.")
