@@ -49,7 +49,7 @@ class MalmoBoatEnv(gym.Env):
             print(self.agent_host.getUsage())
 
         # Generate combined mission with all tracks
-        combined_data = create_combined_tracks_mission(num_tracks=5, track_x_spacing=200)
+        combined_data = create_combined_tracks_mission(num_tracks=2, track_x_spacing=200)
         self.mission_xml = combined_data['mission_xml']
         self.tracks_data = combined_data['tracks']
         self.num_tracks = combined_data['num_tracks']
@@ -66,7 +66,7 @@ class MalmoBoatEnv(gym.Env):
         self._mission_needs_restart = True
 
         # Track current checkpoint
-        self.current_target_checkpoint_idx = 0
+        self.current_target_checkpoint_idx = 1
         self.checkpoints = []
         self.spawn_point = None
         self.num_check_points = 0
@@ -226,6 +226,10 @@ class MalmoBoatEnv(gym.Env):
             time.sleep(0.01)
 
         # Throttle control (discrete)
+
+        #print(f"Throttle: {throttle_action}")
+        #print(f"Steering: {steering_action}")
+
         if throttle_action == 1:
             self.agent_host.sendCommand("forward 1")
         elif throttle_action == 2:
@@ -233,11 +237,11 @@ class MalmoBoatEnv(gym.Env):
 
         # Steering control (discrete) - only apply if throttle is active
         # This prevents spinning in place
-        if throttle_action != 0:  # Only steer if moving
-            if steering_action == 1:
-                self.agent_host.sendCommand("left 1")
-            elif steering_action == 2:
-                self.agent_host.sendCommand("right 1")
+        #if throttle_action != 0:  # Only steer if moving
+        if steering_action == 1:
+            self.agent_host.sendCommand("left 1")
+        elif steering_action == 2:
+            self.agent_host.sendCommand("right 1")
 
         # Wait for physics to update
         time.sleep(TICK_LENGTH * 6)
@@ -281,18 +285,7 @@ class MalmoBoatEnv(gym.Env):
             # Get yaw to detect spinning
             yaw = observation.get('Yaw', 0)
 
-            # Track yaw changes to penalize spinning
-            if hasattr(self, 'last_yaw'):
-                yaw_change = abs(yaw - self.last_yaw)
-                # Normalize for wrap-around (359 -> 0)
-                if yaw_change > 180:
-                    yaw_change = 360 - yaw_change
 
-                # Penalize excessive turning (spinning in place)
-                if yaw_change > 30:  # More than 30 degrees per step
-                    reward -= yaw_change * 0.5  # Penalty proportional to spin
-
-            self.last_yaw = yaw
 
             # Check if touching lava - heavy penalty
             if self._is_in_lava_coords(observation):
@@ -309,8 +302,12 @@ class MalmoBoatEnv(gym.Env):
             # Extra bonus for completing all checkpoints
             if checkpoints_traveled > 0:
                 print(f"Made it to checkpoint {self.current_target_checkpoint_idx}!")
+                self.prev_dist = None
                 if self.current_target_checkpoint_idx >= len(self.checkpoints):
-                    reward += 500.0
+                    reward += 5000.0
+
+
+
 
             # Distance-based shaping
             if self.current_target_checkpoint_idx < len(self.checkpoints):
@@ -321,8 +318,10 @@ class MalmoBoatEnv(gym.Env):
                     reward += (self.prev_dist - dist) * 5.0
                 self.prev_dist = dist
 
+
+
             # Small time penalty to encourage faster completion
-            reward -= 0.1
+            reward -= 0.01
 
         return reward
 
