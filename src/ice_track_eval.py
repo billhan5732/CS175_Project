@@ -1,62 +1,38 @@
 import MalmoPython
 import json
-import random
 import math
 import time
 import sys
-
-from ice_track_testing import create_combined_tracks_mission, RESET_BLOCK_TYPE
+import argparse
 
 import gym
-from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback, CallbackList
 from stable_baselines3 import SAC
 from gym import spaces
 import numpy as np
 
+from ice_track_testing import create_combined_tracks_mission, RESET_BLOCK_TYPE
+
 TICK_LENGTH = 0.05
-TESTING = False
 SEED = 67
-
-# Curriculum stages
-STAGE_FACING   = 1
-STAGE_FULL     = 2
-
-STAGE_1_STEPS_PER_CHECKPOINT = 30
-STAGE_1_EPISODES              = 0    # skip stage 1
-
 INPUT_THRESHOLD = 0.1
-
-# Checkpoint timer
 CHECKPOINT_TIME_LIMIT = 300
 
-# Normalized reward scale — all values kept within ~±10 per step
-SPIN_PENALTY        = -10.0
-LAVA_PENALTY        = -10.0
-CHECKPOINT_REWARD   =  10.0
-DIRECTION_REWARD    =   1.0   # max per step when moving
-DISTANCE_SCALE      =   1.0
-STUCK_PENALTY       =  -1.0
-TIME_PENALTY        =  -0.01
-FORWARD_BONUS       =   0.1
-YAW_PENALTY_SCALE   =   0.02  # per degree when stationary
 
-print("imported successfully!")
+class MalmoBoatEvalEnv(gym.Env):
+    """
+    Eval environment — observation/action spaces match training env exactly.
+    Single checkpoint objective, no curriculum, no track switching.
+    """
 
-
-class MalmoBoatEnv(gym.Env):
     def __init__(self):
-        super(MalmoBoatEnv, self).__init__()
+        super(MalmoBoatEvalEnv, self).__init__()
 
+        # Must exactly match training env
         self.action_space = spaces.Box(
             low=np.array([-1.0, -1.0]),
             high=np.array([1.0, 1.0]),
             dtype=np.float32
         )
-
-        # [dx_to_next_checkpoint, dz_to_next_checkpoint,
-        #  velocity_x, velocity_z,
-        #  cos_angle_to_target, sin_angle_to_target]
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
@@ -64,23 +40,17 @@ class MalmoBoatEnv(gym.Env):
             dtype=np.float32
         )
 
-        # Malmo agent host
         self.agent_host = MalmoPython.AgentHost()
         try:
             self.agent_host.parse(sys.argv)
         except RuntimeError as e:
-            print(f'ERROR parsing agent arguments: {e}')
+            print(f"ERROR parsing agent arguments: {e}")
             print(self.agent_host.getUsage())
 
         combined_data = create_combined_tracks_mission(num_tracks=2, track_x_spacing=200, seed=SEED)
-        self.mission_xml = combined_data['mission_xml']
-        self.tracks_data = combined_data['tracks']
-        self.num_tracks = combined_data['num_tracks']
-        self.track_spacing = combined_data['track_spacing']
-
-        self.current_track_idx = 0
-        self.episodes_on_current_track = 0
-        self.episodes_per_track = 10
+        self.mission_xml   = combined_data['mission_xml']
+        self.tracks_data   = combined_data['tracks']
+        self.num_tracks    = combined_data['num_tracks']
 
         self._mission_running = False
         self._mission_needs_restart = True
@@ -88,14 +58,12 @@ class MalmoBoatEnv(gym.Env):
         self.current_target_checkpoint_idx = 1
         self.checkpoints = []
         self.spawn_point = None
-        self.num_check_points = 0
         self.prev_dist = None
         self.prev_pos = None
         self.prev_yaw = None
-
         self.last_raw_obs = None
-        self.reset_block_type = RESET_BLOCK_TYPE
         self.checkpoint_threshold = 5.0
+        self.reset_block_type = RESET_BLOCK_TYPE
 
         self.position_history = []
         self.position_history_len = 20
@@ -105,13 +73,7 @@ class MalmoBoatEnv(gym.Env):
         self.last_steering = 0.0
         self.last_throttle = 0.0
 
-        self.stage = STAGE_FULL
-        self.total_episodes = 0
-
-        # Stage 1 state (kept in case curriculum is re-enabled)
-        self.stage1_step_count = 0
-        self.stage1_checkpoint_idx = 0
-        self.stage1_aligned_steps = 0
+        self.current_track_idx = 0
 
     # ------------------------------------------------------------------
     # Helpers
@@ -151,101 +113,50 @@ class MalmoBoatEnv(gym.Env):
         time.sleep(TICK_LENGTH * 5)
 
         self.prev_yaw = None
-        self.stage1_aligned_steps = 0
-
-    def tpToTrackSpawnAndSpawnBoat(self):
-        spawn_x, spawn_z = self.spawn_point
-        self._kill_boats_and_respawn(spawn_x, spawn_z)
-
-    def _teleport_to_checkpoint(self, checkpoint_idx):
-        cp = self.checkpoints[checkpoint_idx]
-        cp_x, cp_z = cp[0], cp[1]
-        print(f"[Stage 1] Teleporting to checkpoint {checkpoint_idx} at ({cp_x}, {cp_z})")
-        self._kill_boats_and_respawn(cp_x, cp_z)
-
-    # ------------------------------------------------------------------
-    # Done check
-    # ------------------------------------------------------------------
-
-    def _check_done(self, world_state):
-        # Reached the next checkpoint — episode success
-        if self.current_target_checkpoint_idx >= len(self.checkpoints):
-            print("Checkpoint reached! Episode complete.")
-            return True
-        if self.last_raw_obs is not None:
-            if self._is_in_lava_coords(self.last_raw_obs):
-                print("Fell into lava! Resetting...")
-                return True
-        if self.checkpoint_timer > CHECKPOINT_TIME_LIMIT:
-            print(f"Checkpoint timer expired! Resetting...")
-            return True
-        if not world_state.is_mission_running:
-            print("Mission not running!")
-            self._mission_needs_restart = True
-            return True
-        return False
+        self.last_raw_obs = None
 
     # ------------------------------------------------------------------
     # Reset
     # ------------------------------------------------------------------
 
     def reset(self):
-        self.total_episodes += 1
-
-        if self.episodes_on_current_track >= self.episodes_per_track:
-            self.episodes_on_current_track = 0
-            self.current_track_idx = (self.current_track_idx + 1) % self.num_tracks
-            print(f"Switching to track {self.current_track_idx}")
-
         if self._mission_needs_restart:
             return self._full_reset()
         else:
             return self._quick_respawn()
 
     def _quick_respawn(self):
-        print(f"Quick Respawn | Track {self.current_track_idx} | Episode {self.total_episodes}")
-
         self.spawn_point, self.checkpoints = self._get_current_track_info()
         self.checkpoints = self.checkpoints.copy()
         self.checkpoints.append(self.checkpoints[0])
-        self.num_check_points = len(self.checkpoints)
 
-        # Pick a random starting checkpoint each episode for variety
-        start_idx = random.randint(0, len(self.checkpoints) - 2)
-        self.current_target_checkpoint_idx = start_idx + 1
-
+        # Always start from checkpoint 0 in eval for consistency
+        self.current_target_checkpoint_idx = 1
         self.prev_dist = None
         self.prev_pos = None
         self.prev_yaw = None
-        self.stage1_aligned_steps = 0
         self.position_history = []
         self.checkpoint_timer = 0
         self.last_steering = 0.0
         self.last_throttle = 0.0
-        self.episodes_on_current_track += 1
 
-        # Teleport to start_idx so agent is physically at the correct position
-        self._kill_boats_and_respawn(
-            self.checkpoints[start_idx][0],
-            self.checkpoints[start_idx][1]
-        )
+        self._kill_boats_and_respawn(self.checkpoints[0][0], self.checkpoints[0][1])
         return self._get_observation()
 
     def _full_reset(self):
-        print("Starting combined mission with all tracks...")
+        print("Starting eval mission...")
 
         mission = MalmoPython.MissionSpec(self.mission_xml, True)
         mission_record = MalmoPython.MissionRecordSpec()
 
-        max_retries = 3
-        for retry in range(max_retries):
+        for attempt in range(3):
             try:
                 self.agent_host.startMission(mission, mission_record)
                 break
             except RuntimeError as e:
-                if retry < max_retries - 1:
-                    print(f"Error starting mission (attempt {retry + 1}/{max_retries}): {e}")
-                    time.sleep(2.0 * (retry + 1))
+                if attempt < 2:
+                    print(f"Mission start failed (attempt {attempt + 1}): {e}")
+                    time.sleep(2.0 * (attempt + 1))
                 else:
                     raise
 
@@ -260,30 +171,18 @@ class MalmoBoatEnv(gym.Env):
         self.spawn_point, self.checkpoints = self._get_current_track_info()
         self.checkpoints = self.checkpoints.copy()
         self.checkpoints.append(self.checkpoints[0])
-        self.num_check_points = len(self.checkpoints)
 
-        # Pick a random starting checkpoint
-        start_idx = random.randint(0, len(self.checkpoints) - 2)
-        self.current_target_checkpoint_idx = start_idx + 1
-
+        self.current_target_checkpoint_idx = 1
         self.prev_dist = None
         self.prev_pos = None
         self.prev_yaw = None
-        self.stage1_aligned_steps = 0
         self.position_history = []
         self.checkpoint_timer = 0
         self.last_steering = 0.0
         self.last_throttle = 0.0
 
         time.sleep(10)
-
-        # Teleport to start_idx so agent is physically at the correct position
-        self._kill_boats_and_respawn(
-            self.checkpoints[start_idx][0],
-            self.checkpoints[start_idx][1]
-        )
-
-        self.episodes_on_current_track += 1
+        self._kill_boats_and_respawn(self.checkpoints[0][0], self.checkpoints[0][1])
         return self._get_observation()
 
     # ------------------------------------------------------------------
@@ -291,8 +190,8 @@ class MalmoBoatEnv(gym.Env):
     # ------------------------------------------------------------------
 
     def step(self, action):
-        throttle = action[0]
-        steering = action[1]
+        throttle = float(action[0])
+        steering = float(action[1])
 
         self.last_throttle = throttle
         self.last_steering = steering
@@ -325,7 +224,7 @@ class MalmoBoatEnv(gym.Env):
         reward = self._compute_reward()
 
         if throttle > INPUT_THRESHOLD:
-            reward += FORWARD_BONUS
+            reward += 0.1  # FORWARD_BONUS
 
         done = self._check_done(world_state)
 
@@ -339,7 +238,7 @@ class MalmoBoatEnv(gym.Env):
         return obs, reward, done, info
 
     # ------------------------------------------------------------------
-    # Reward
+    # Reward — exact copy of training env
     # ------------------------------------------------------------------
 
     def _compute_reward(self):
@@ -363,10 +262,9 @@ class MalmoBoatEnv(gym.Env):
             facing_x = -math.sin(math.radians(yaw))
             facing_z =  math.cos(math.radians(yaw))
 
-            # Spinning in place — only check after grace period
+            # Spinning in place
             if self.checkpoint_timer > 10 and speed < 0.3 and abs(self.last_steering) > INPUT_THRESHOLD:
-                print("Spinning in place!")
-                reward += SPIN_PENALTY
+                reward += -10.0
                 return reward
 
             # Yaw penalty when stationary
@@ -374,20 +272,19 @@ class MalmoBoatEnv(gym.Env):
                 yaw_delta = abs(yaw - self.prev_yaw)
                 if yaw_delta > 180:
                     yaw_delta = 360 - yaw_delta
-                reward -= yaw_delta * YAW_PENALTY_SCALE
+                reward -= yaw_delta * 0.02
             self.prev_yaw = yaw
 
             # Lava
             if self._is_in_lava_coords(observation):
-                reward += LAVA_PENALTY
+                reward += -10.0
                 return reward
 
             # Checkpoint reached
             if self.current_target_checkpoint_idx < len(self.checkpoints):
-                reached = self._check_checkpoint_coords(x, y, z)
-                if reached:
+                if self._check_checkpoint_coords(x, y, z):
                     print(f"Reached checkpoint {self.current_target_checkpoint_idx}!")
-                    reward += CHECKPOINT_REWARD
+                    reward += 10.0
                     self.current_target_checkpoint_idx += 1
                     self.checkpoint_timer = 0
                     self.prev_dist = None
@@ -399,18 +296,14 @@ class MalmoBoatEnv(gym.Env):
                 dx = target[0] - x
                 dz = target[1] - z
                 target_len = math.sqrt(dx ** 2 + dz ** 2)
-                if target_len > 0:
-                    cos_angle = facing_x * (dx / target_len) + facing_z * (dz / target_len)
-                else:
-                    cos_angle = 1.0
+                cos_angle = (facing_x * (dx / target_len) + facing_z * (dz / target_len)) if target_len > 0 else 1.0
 
                 if speed > 0.3:
-                    reward += max(0, cos_angle) ** 3 * DIRECTION_REWARD
+                    reward += max(0, cos_angle) ** 3 * 1.0
 
-                # Distance shaping
                 dist = math.sqrt(dx ** 2 + dz ** 2)
                 if speed > 0.5 and self.prev_dist is not None:
-                    reward += (self.prev_dist - dist) * DISTANCE_SCALE
+                    reward += (self.prev_dist - dist) * 1.0
                 self.prev_dist = dist
 
             # Stuck penalty
@@ -421,36 +314,42 @@ class MalmoBoatEnv(gym.Env):
                 oldest_x, oldest_z = self.position_history[0]
                 displacement = math.sqrt((x - oldest_x) ** 2 + (z - oldest_z) ** 2)
                 if displacement < self.stuck_threshold:
-                    reward += STUCK_PENALTY
+                    reward += -1.0
 
-            reward += TIME_PENALTY
+            reward += -0.01
 
         return reward
 
     # ------------------------------------------------------------------
-    # Checkpoint / lava helpers
+    # Done / helpers
     # ------------------------------------------------------------------
 
-    def _check_checkpoint_coords(self, agent_x, agent_y, agent_z):
-        if not hasattr(self, '_checkpoint_debug_done'):
-            self._checkpoint_debug_done = True
-            print(f"\nCheckpoint system initialized")
-            print(f"Agent at ({agent_x:.1f}, {agent_y:.1f}, {agent_z:.1f})")
-            print(f"Next checkpoint: {self.checkpoints[self.current_target_checkpoint_idx]}")
-            print(f"Detection threshold: {self.checkpoint_threshold} blocks\n")
-
-        expected = self.checkpoints[self.current_target_checkpoint_idx]
-        checkpoint_dist = np.sqrt((expected[0] - agent_x) ** 2 + (expected[1] - agent_z) ** 2)
-        if checkpoint_dist < self.checkpoint_threshold:
+    def _check_done(self, world_state):
+        if self.current_target_checkpoint_idx >= len(self.checkpoints):
+            print("All checkpoints reached!")
+            return True
+        if self.last_raw_obs is not None and self._is_in_lava_coords(self.last_raw_obs):
+            print("Fell into lava!")
+            return True
+        if self.checkpoint_timer > CHECKPOINT_TIME_LIMIT:
+            print("Checkpoint timer expired!")
+            return True
+        if not world_state.is_mission_running:
+            print("Mission not running!")
+            self._mission_needs_restart = True
             return True
         return False
 
+    def _check_checkpoint_coords(self, agent_x, agent_y, agent_z):
+        expected = self.checkpoints[self.current_target_checkpoint_idx]
+        dist = np.sqrt((expected[0] - agent_x) ** 2 + (expected[1] - agent_z) ** 2)
+        return dist < self.checkpoint_threshold
+
     def _is_in_lava_coords(self, observation):
-        y = observation.get('YPos', 227)
-        return y < 226.5
+        return observation.get('YPos', 227) < 226.5
 
     # ------------------------------------------------------------------
-    # Observation
+    # Observation — exact copy of training env
     # ------------------------------------------------------------------
 
     def _get_observation(self, world_state=None):
@@ -489,11 +388,8 @@ class MalmoBoatEnv(gym.Env):
 
                 target_len = math.sqrt(dx_to_target ** 2 + dz_to_target ** 2)
                 if target_len > 0:
-                    target_x = dx_to_target / target_len
-                    target_z = dz_to_target / target_len
-                    cos_angle = facing_x * target_x + facing_z * target_z
-                    sin_angle = facing_x * target_z - facing_z * target_x
-
+                    cos_angle = facing_x * (dx_to_target / target_len) + facing_z * (dz_to_target / target_len)
+                    sin_angle = facing_x * (dz_to_target / target_len) - facing_z * (dx_to_target / target_len)
                     if cos_angle > 0.95:
                         print(f"Facing checkpoint {self.current_target_checkpoint_idx} | cos_angle: {cos_angle:.3f}")
                 else:
@@ -518,99 +414,75 @@ class MalmoBoatEnv(gym.Env):
 
         return np.zeros(6, dtype=np.float32)
 
-    # ------------------------------------------------------------------
-    # Cleanup
-    # ------------------------------------------------------------------
-
     def close(self):
         if self._mission_running:
             try:
                 self.agent_host.sendCommand("quit")
-            except:
+            except Exception:
                 pass
+        self._mission_running = False
 
 
 # ------------------------------------------------------------------
-# Callbacks
+# Eval runner
 # ------------------------------------------------------------------
 
-class RewardLoggingCallback(BaseCallback):
-    def __init__(self):
-        super().__init__()
-        self.episode_rewards = []
-        self.episode_lengths = []
-        self.current_episode_reward = 0
-        self.current_episode_length = 0
-        self.episode_count = 0
+def run_evaluation(model_path="boat_racing_sac_interrupted", num_episodes=5):
+    env = MalmoBoatEvalEnv()
 
-    def _on_step(self):
-        self.current_episode_reward += self.locals['rewards'][0]
-        self.current_episode_length += 1
+    print(f"Loading model from: {model_path}")
+    model = SAC.load(model_path, env=env)
+    print("Model loaded successfully!")
 
-        if self.locals['dones'][0]:
-            self.episode_count += 1
-            self.episode_rewards.append(self.current_episode_reward)
-            self.episode_lengths.append(self.current_episode_length)
-            print(f"  Episode {self.episode_count} | "
-                  f"Reward: {self.current_episode_reward:.1f} | "
-                  f"Length: {self.current_episode_length}")
-            self.current_episode_reward = 0
-            self.current_episode_length = 0
+    episode_rewards = []
+    episode_checkpoints = []
 
-        return True
+    for episode in range(num_episodes):
+        print(f"\n{'='*50}")
+        print(f"Episode {episode + 1} / {num_episodes}")
+        print(f"{'='*50}")
+
+        obs = env.reset()
+        done = False
+        total_reward = 0.0
+        step_count = 0
+
+        while not done:
+            action, _ = model.predict(obs, deterministic=True)
+            obs, reward, done, info = env.step(action)
+            total_reward += reward
+            step_count += 1
+
+            if step_count % 50 == 0:
+                print(f"  Step {step_count} | Checkpoint {info['checkpoint']}/{info['total_checkpoints']} "
+                      f"| Running reward: {total_reward:.1f}")
+
+        checkpoints_reached = info['checkpoint'] - 1  # subtract 1 since idx is next target
+        print(f"\nEpisode {episode + 1} complete!")
+        print(f"  Steps:        {step_count}")
+        print(f"  Total reward: {total_reward:.2f}")
+        print(f"  Checkpoints:  {checkpoints_reached} / {info['total_checkpoints'] - 1}")
+        episode_rewards.append(total_reward)
+        episode_checkpoints.append(checkpoints_reached)
+
+    print(f"\n{'='*50}")
+    print(f"Evaluation Summary ({num_episodes} episodes)")
+    print(f"  Mean reward:      {np.mean(episode_rewards):.2f}")
+    print(f"  Max reward:       {np.max(episode_rewards):.2f}")
+    print(f"  Min reward:       {np.min(episode_rewards):.2f}")
+    print(f"  Mean checkpoints: {np.mean(episode_checkpoints):.1f}")
+    print(f"{'='*50}")
+
+    env.close()
+    return episode_rewards
 
 
-# ------------------------------------------------------------------
-# Main
-# ------------------------------------------------------------------
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Evaluate a trained SAC boat racing agent.")
+    parser.add_argument("--model", type=str, default="boat_racing_sac_interrupted",
+                        help="Path to saved SAC model")
+    parser.add_argument("--episodes", type=int, default=5,
+                        help="Number of episodes to run")
+    args = parser.parse_args()
 
-if __name__ == "__main__" and not TESTING:
-    env = MalmoBoatEnv()
-
-    """
-    model = SAC(
-        "MlpPolicy",
-        env,
-        learning_rate=3e-4,
-        buffer_size=50000,
-        learning_starts=200,
-        batch_size=64,
-        train_freq=(1, "step"),
-        gradient_steps=4,
-        verbose=1,
-    )
-    """
-
-    model = SAC.load("boat_racing_sac_interrupted", env=env)
-
-    reward_callback = RewardLoggingCallback()
-    checkpoint_callback = CheckpointCallback(
-        save_freq=10000,
-        save_path="./models/",
-        name_prefix="boat_racing_sac"
-    )
-
-    print("Starting training...")
-    print(f"Objective: reach next checkpoint only")
-    print(f"Checkpoint time limit: {CHECKPOINT_TIME_LIMIT} steps")
-    print(f"Spin penalty: {SPIN_PENALTY} | Lava penalty: {LAVA_PENALTY} | Checkpoint reward: {CHECKPOINT_REWARD}")
-
-    try:
-        model.learn(
-            total_timesteps=500000,
-            callback=CallbackList([reward_callback, checkpoint_callback])
-        )
-        print("Training complete! Saving final model...")
-        model.save("boat_racing_sac_final")
-        print("Model saved as 'boat_racing_sac_final'")
-        print(f"Track Seed: {SEED}")
-
-    except KeyboardInterrupt:
-        print("\n\nTraining interrupted by user (Ctrl+C)!")
-        print("Saving model before exit...")
-        model.save("boat_racing_sac_interrupted")
-        print("Model saved as 'boat_racing_sac_interrupted'")
-
-    finally:
-        env.close()
-        print("Environment closed.")
+    run_evaluation(model_path=args.model, num_episodes=args.episodes)

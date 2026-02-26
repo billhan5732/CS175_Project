@@ -391,11 +391,14 @@ def generate_star_race_track_with_offset(num_points=12, min_width=6, max_width=1
     return "\n".join(xml_blocks), checkpoint_positions, segment_widths, bridges, (spawn_x, spawn_z), start_vertex_idx
 
 
-def create_combined_tracks_mission(num_tracks=5, track_x_spacing=200):
+def create_combined_tracks_mission(num_tracks=5, track_x_spacing=200, seed=None):
     """
     Generate multiple tracks at different X positions in a single mission.
     Much faster version - applies offset during generation instead of parsing XML
     """
+    if seed is not None:
+        random.seed(seed)
+
     all_tracks_drawing = []
     tracks_data = []
 
@@ -405,8 +408,8 @@ def create_combined_tracks_mission(num_tracks=5, track_x_spacing=200):
 
         # Generate track with varied parameters
         num_points = random.choice([8, 10, 12, 14, 16])
-        min_width = random.randint(5, 8)
-        max_width = random.randint(12, 20)
+        min_width = random.randint(12, 16)  # 5 and 8 originally
+        max_width = random.randint(20, 28)  # 12 and 20 originally
         bridge_prob = random.uniform(0.3, 0.6)
 
         # Generate track with offset already applied - much faster!
@@ -485,7 +488,7 @@ def create_combined_tracks_mission(num_tracks=5, track_x_spacing=200):
                 <ObservationFromGrid>
                     <Grid name="nearby_blocks">
                         <min x="-3" y="-1" z="-3"/>
-                        <max x="3" y="1" z="3"/>
+                        <max x="3" y="5" z="3"/>
                     </Grid>
                 </ObservationFromGrid>
 
@@ -544,7 +547,7 @@ def create_mission_xml(track_xml, spawn_point, seed=None):
 
                     {track_xml}
                     <!-- Spawn boat at starting checkpoint -->
-                    <DrawEntity x="{spawn_x}" y="227" z="{spawn_z}" type="Boat"/>
+                    <!-- <DrawEntity x="{spawn_x}" y="227" z="{spawn_z}" type="Boat"/> -->
                 </DrawingDecorator>
                 <!-- <ServerQuitFromTimeUp timeLimitMs="120000"/> -->
                 <!-- REMOVE OR COMMENT OUT ServerQuitWhenAnyAgentFinishes -->
@@ -565,7 +568,7 @@ def create_mission_xml(track_xml, spawn_point, seed=None):
                 <ObservationFromGrid>
                     <Grid name="nearby_blocks">
                         <min x="-3" y="-1" z="-3"/>
-                        <max x="3" y="1" z="3"/>
+                        <max x="3" y="5" z="3"/>
                     </Grid>
                 </ObservationFromGrid>
 
@@ -578,11 +581,7 @@ def create_mission_xml(track_xml, spawn_point, seed=None):
                         <command>setPitch</command>
                     </ModifierList>
                 </AbsoluteMovementCommands>
-                <MissionQuitCommands/>
                 <AgentQuitFromReachingCommandQuota total="0"/>
-
-
-
             </AgentHandlers>
         </AgentSection>
     </Mission>'''
@@ -597,8 +596,8 @@ def create_varied_environments(num_envs=10):
     for i in range(num_envs):
         # Vary difficulty
         num_points = random.choice([8, 10, 12, 14, 16])  # Must be even for star
-        min_width = random.randint(5, 8)
-        max_width = random.randint(12, 20)
+        min_width = random.randint(12, 16) #5 and 8 originally
+        max_width = random.randint(20, 28) # 12 and 20 originally
         bridge_prob = random.uniform(0.3, 0.6)  # 30-60% chance of bridges
 
         track_xml, cp_pos, seg_widths, bridges, spawn, start_idx = generate_star_race_track(
