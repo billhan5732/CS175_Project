@@ -10,8 +10,7 @@ title: Status
 
 https://youtu.be/qui1wv2CaBU
 
-<iframe width="560" height="315" src="https://youtu.be/qui1wv2CaBU" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe>
-
+[![Video Title](https://img.youtube.com/vi/qui1wv2CaBU/0.jpg)](https://youtu.be/qui1wv2CaBU)
 
 ## Approach
 
