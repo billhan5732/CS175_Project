@@ -16,19 +16,16 @@ https://youtu.be/qui1wv2CaBU
 
 Our agent is trained to autonomously navigate a Minecraft boat along procedurally generated ice tracks using reinforcement learning. The environment is implemented using Project Malmo and exposed as a custom OpenAI Gym environment. The agent learns to drive a boat from one checkpoint to the next while avoiding hazards such as lava and minimizing inefficient behaviors such as spinning or getting stuck.
 
-We use the Soft Actor-Critic (SAC) algorithm (Haarnoja et al., 2018), implemented using the Stable-Baselines3 library. SAC is an off-policy actor-critic algorithm designed for continuous control tasks. It learns a stochastic policy 
-$
-\pi_{\theta}(a \mid s)
-$
+We use the Soft Actor-Critic (SAC) algorithm (Haarnoja et al., 2018), implemented using the Stable-Baselines3 library. SAC is an off-policy actor-critic algorithm designed for continuous control tasks. It learns a stochastic policy $pi_{\theta}(a \mid s)$
 that maximizes both expected reward and policy entropy. The objective is:
 
-$
+$$
 J(\pi) =
 \mathbb{E}_{(s_t,a_t) \sim \rho_{\pi}}
 \left[
 \sum_{t} r(s_t,a_t) + \alpha \mathcal{H}(\pi(\cdot \mid s_t))
 \right]
-$
+$$
 
 We use the default multilayer perceptron policy (MlpPolicy) from Stable-Baselines3.
   
