@@ -36,15 +36,37 @@ We will mainly be using Reinforcement Learning strategies with this agent. Some 
 
 ## Evaluation Plan
 
-We will evaluate our model based on a few key metrics:
-- Speed/Lap Time
-- Staying on Track
-- Track Progress (not idling for too long)
+We will evaluate our agent using the following metrics:
+
+- **Speed (Lap Time)**
+  - Measure total time to complete a track
+  - Track average and best lap times across multiple runs
+  - Compare early vs later training performance
+
+- **Track Completion**
+  - Measure percentage of runs where the agent successfully finishes the track
+  - Use a fixed time limit to determine success or failure
+  - Reflects overall reliability of the agent
+
+- **Stability (Staying on Track)**
+  - Track number of falls or resets per run
+  - Measure time spent off-track
+  - Evaluate how consistently the agent maintains control
+
+- **Progress Efficiency**
+  - Measure checkpoints reached per episode
+  - Track forward progress per timestep
+  - Ensure the agent is not idling or exploiting unintended behaviors
+
+- **Learning Progress**
+  - Monitor performance trends over training 
+  - Evaluate whether the agent improves over time
 
 
 ## Meetings
 Jan 23rd, 2026 3:45pm - First meeting on zoom.
-
+Feb 13rd, 2026 11:15am - Second meeting on zoom.
+Mar 6th, 2026 10:15am - Third meeting on zoom.
 
 ## AI Tool Usage
 No AI Tool has been utilzied so far.
