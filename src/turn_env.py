@@ -1,0 +1,427 @@
+"""
+malmo_boat_env_dqn.py
+
+Architecture matches the working old PPO env:
+  - Mission runs FOREVER — one startMission call only
+  - Quick respawn = TP within same running mission (no startMission)
+  - Lava detected via Y coordinate (works through boats, reliable)
+  - Full reset only when is_mission_running goes False unexpectedly
+
+Boat mounting fix:
+  - moveMouse 0 POSITIVE = pitch DOWN (toward feet)
+  - moveMouse 0 NEGATIVE = pitch UP (toward sky)
+  - Old code did moveMouse 0 -1000 (looked UP) then tried to use boat
+  - Fix: moveMouse 0 1000 to look DOWN at boat, then use, then 0 -600 to reset
+"""
+
+import json
+import math
+import time
+from pathlib import Path
+
+import gym
+import MalmoPython
+import numpy as np
+from gym import spaces
+
+from ice_track_testing import generate_tracks, RESET_BLOCK_TYPE
+
+CLIENT_PORT = 10000
+TICK_LENGTH = 0.05
+TIME_WAIT   = 0.05
+MAX_LOOP    = 50
+
+
+class MalmoBoatEnv(gym.Env):
+    """
+    Ice boat racing — DQN.
+
+    Mission runs continuously. Episodes end in Python but Malmo mission
+    keeps running. Quick respawn just TPs the agent back to spawn and
+    summons a fresh boat — no startMission call needed.
+    """
+
+    ACTION_MAP = {
+        0: ("forward", None),
+        1: ("forward", "left"),
+        2: ("forward", "right"),
+        3: (None,      "left"),
+        4: (None,      "right"),
+        5: (None,      None),
+    }
+
+    def __init__(self,
+                 mission_xml_path="boat_mission.xml",
+                 millisec_per_tick=20,
+                 num_tracks=5):
+
+        super(MalmoBoatEnv, self).__init__()
+
+        self.millisec_per_tick = millisec_per_tick
+        self.num_tracks_cfg    = num_tracks
+
+        self.xml_template = Path(mission_xml_path).read_text()
+
+        self.action_space = spaces.Discrete(len(self.ACTION_MAP))
+        self.observation_space = spaces.Box(
+            low=-np.inf, high=np.inf, shape=(10,), dtype=np.float32
+        )
+
+        self.agent_host     = MalmoPython.AgentHost()
+        self.mission_record = MalmoPython.MissionRecordSpec()
+        self.mission_record.recordRewards()
+        self.mission_record.recordObservations()
+        self.pool = MalmoPython.ClientPool()
+        self.pool.add(MalmoPython.ClientInfo('127.0.0.1', CLIENT_PORT))
+
+        self._generate_new_tracks()
+
+        self.current_track_idx         = 0
+        self.episodes_on_current_track = 0
+        self.episodes_per_track        = 2
+        self._mission_running          = False
+        self._mission_needs_restart    = True
+
+        self.checkpoints                   = []
+        self.spawn_point                   = None
+        self.num_check_points              = 0
+        self.current_target_checkpoint_idx = 0
+        self.prev_dist                     = None
+        self.last_raw_obs                  = None
+        self.last_obs                      = np.zeros(10, dtype=np.float32)
+
+        self.checkpoint_threshold = 5.0
+
+    # -------------------------------------------------------------------------
+    # Public API
+    # -------------------------------------------------------------------------
+
+    def reset(self):
+        if self.episodes_on_current_track >= self.episodes_per_track:
+            self.episodes_on_current_track = 0
+            self.current_track_idx = (self.current_track_idx + 1) % self.num_tracks
+            print(f"Switching to track {self.current_track_idx}")
+
+        if self._mission_needs_restart:
+            return self._full_reset()
+        else:
+            return self._quick_respawn()
+
+    def step(self, action):
+        self._send_action(action)
+        time.sleep(TICK_LENGTH * 6)
+
+        # Clear commands after action
+        for key in ["forward", "back", "left", "right"]:
+            self.agent_host.sendCommand(f"{key} 0")
+
+        world_state = self.agent_host.getWorldState()
+        obs    = self._get_observation(world_state)
+        reward = self._compute_reward()
+        done   = self._check_done(world_state)
+
+        return obs, reward, done, {
+            'checkpoint':        self.current_target_checkpoint_idx,
+            'total_checkpoints': self.num_check_points,
+            'track_idx':         self.current_track_idx,
+        }
+
+    def close(self):
+        if self._mission_running:
+            try:
+                self.agent_host.sendCommand("quit")
+            except Exception:
+                pass
+        self._mission_running = False
+        print("Env closed.")
+
+    # -------------------------------------------------------------------------
+    # Track generation
+    # -------------------------------------------------------------------------
+
+    def _generate_new_tracks(self):
+        data             = generate_tracks(num_tracks=self.num_tracks_cfg)
+        self.track_xml   = data['draw_xml']
+        self.tracks_data = data['tracks']
+        self.num_tracks  = data['num_tracks']
+        print(f"Generated {self.num_tracks} tracks.")
+
+    # -------------------------------------------------------------------------
+    # Reset helpers
+    # -------------------------------------------------------------------------
+
+    def _full_reset(self):
+        """
+        Start the Malmo mission — called ONCE at the beginning.
+        After this, quick_respawn handles all subsequent episodes
+        by TPing within the same running mission.
+        """
+        print("Starting mission (full reset)...")
+        self._init_episode_state()
+        spawn_x, spawn_z = self.spawn_point
+
+        xml = (self.xml_template
+               .replace('{PLACEHOLDER_MSPERTICK}', str(self.millisec_per_tick))
+               .replace('{PLACEHOLDER_TRACK_XML}',  self.track_xml)
+               .replace('{PLACEHOLDER_SPAWN_X}',    str(spawn_x))
+               .replace('{PLACEHOLDER_SPAWN_Z}',    str(spawn_z)))
+        mission = MalmoPython.MissionSpec(xml, False)
+
+        for retry in range(5):
+            try:
+                self.agent_host.startMission(
+                    mission, self.pool, self.mission_record, 0, 'boat_racer'
+                )
+                break
+            except RuntimeError as e:
+                print(f"Retry {retry+1}/5: {e}")
+                time.sleep(5 * (retry + 1))
+        else:
+            raise RuntimeError("Could not start mission after 5 attempts")
+
+        world_state = self.agent_host.getWorldState()
+        while not world_state.has_mission_begun:
+            time.sleep(TIME_WAIT * self.millisec_per_tick / 20)
+            world_state = self.agent_host.getWorldState()
+
+        self._mission_running       = True
+        self._mission_needs_restart = False
+        self.episodes_on_current_track += 1
+
+        print("Waiting for world to build...")
+        time.sleep(15)
+        self._tp_spawn_and_boat()
+        return self._get_observation()
+
+    def _quick_respawn(self):
+        """
+        TP within the SAME running mission — no startMission call.
+        Lava is detected via Y coordinate so the mission never actually
+        ends — Python just treats it as episode done and we teleport back.
+        This is instant compared to restarting the mission.
+        """
+        print(f"Quick respawn on track {self.current_track_idx}")
+        self._init_episode_state()
+        self._tp_spawn_and_boat()
+        self.episodes_on_current_track += 1
+        return self._get_observation()
+
+    def _init_episode_state(self):
+        track            = self.tracks_data[self.current_track_idx]
+        self.spawn_point = tuple(track['spawn_point'])
+        self.checkpoints = [tuple(cp) for cp in track['checkpoints']]
+        self.checkpoints.append(self.checkpoints[0])
+        self.num_check_points              = len(self.checkpoints)
+        self.current_target_checkpoint_idx = 1
+        self.prev_dist                     = None
+
+    def _tp_spawn_and_boat(self):
+        """
+        Teleport to spawn and mount a fresh boat.
+
+        Mount strategy from the working PPO code: no camera manipulation.
+        TP the agent directly onto the boat's coordinates. At the same
+        x/y/z the agent entity overlaps the boat hitbox and 'use 1' mounts
+        regardless of camera angle. Camera angle is irrelevant to mounting —
+        only proximity matters.
+        """
+        spawn_x, spawn_z = self.spawn_point
+        self.agent_host.sendCommand("chat /kill @e[type=minecraft:boat]")
+
+        # 1. Clear all keys
+        for key in ["forward", "back", "left", "right"]:
+            self.agent_host.sendCommand(f"{key} 0")
+        time.sleep(TICK_LENGTH * 10)
+
+        # 2. TP high above — agent stationary before boat spawns
+        self.agent_host.sendCommand(f"tp {spawn_x} 230 {spawn_z}")
+        time.sleep(TICK_LENGTH * 20)
+
+        self.agent_host.sendCommand("moveMouse 0 -1000")
+        self.agent_host.sendCommand("setYaw 0")
+        time.sleep(TICK_LENGTH * 5)
+
+        # 3. Summon boat at spawn level
+        self.agent_host.sendCommand(
+            f"chat /summon minecraft:boat {spawn_x} 227 {spawn_z}"
+        )
+        time.sleep(TICK_LENGTH * 20)
+        
+        # 4. TP directly onto the boat — same coords, triggers mount hitbox
+        self.agent_host.sendCommand(f"tp {spawn_x} 227 {spawn_z}")
+
+        self.agent_host.sendCommand("use 1")
+        time.sleep(TICK_LENGTH * 5)
+        self.agent_host.sendCommand("use 0")
+        time.sleep(TICK_LENGTH * 5)
+
+        self.agent_host.sendCommand("moveMouse 0 600")
+        time.sleep(TICK_LENGTH * 5)
+    # -------------------------------------------------------------------------
+    # Step helpers
+    # -------------------------------------------------------------------------
+
+    def _send_action(self, action):
+        for key in ["forward", "back", "left", "right"]:
+            self.agent_host.sendCommand(f"{key} 0")
+        throttle, steering = self.ACTION_MAP[int(action)]
+        if throttle:
+            self.agent_host.sendCommand(f"{throttle} 1")
+        if steering:
+            self.agent_host.sendCommand(f"{steering} 1")
+
+    def _check_done(self, world_state):
+        """
+        Episode ends if:
+          - All checkpoints reached
+          - Agent Y drops below ice (lava detection via coordinate)
+          - Mission stops running unexpectedly (triggers full restart)
+        Mission is NOT quit — it keeps running for the next episode.
+        """
+        if self.current_target_checkpoint_idx >= self.num_check_points:
+            print("All checkpoints reached!")
+            return True
+
+        if self.last_raw_obs is not None:
+            y = self.last_raw_obs.get('YPos', 227)
+            if y < 226.5:
+                print("Lava detected (Y below ice) — quick respawn")
+                return True
+
+        if not world_state.is_mission_running:
+            print("Mission stopped unexpectedly — full restart")
+            self._mission_needs_restart = True
+            self._mission_running       = False
+            return True
+
+        return False
+
+    def _compute_reward(self):
+        reward = 0.0
+        if self.last_raw_obs is None:
+            return reward
+
+        obs  = self.last_raw_obs
+        x    = obs.get('XPos', 0)
+        y    = obs.get('YPos', 227)
+        z    = obs.get('ZPos', 0)
+        vx   = obs.get('XVel', 0.0)
+        vz   = obs.get('ZVel', 0.0)
+        yaw  = obs.get('Yaw',  0.0)
+
+        # Lava — end immediately
+        if y < 226.5:
+            return -1000.0
+
+        if self.current_target_checkpoint_idx >= len(self.checkpoints):
+            return reward
+
+        tx, tz = self.checkpoints[self.current_target_checkpoint_idx]
+        dx_t   = tx - x
+        dz_t   = tz - z
+        dist   = math.sqrt(dx_t**2 + dz_t**2)
+        speed  = math.sqrt(vx**2 + vz**2)
+
+        # Correct Minecraft yaw → relative angle to checkpoint
+        # yaw=0 south(+Z), yaw=90 west(-X), yaw=-90 east(+X)
+        yaw_rad  = math.radians(yaw)
+        target_a = math.atan2(dx_t, dz_t)
+        facing_a = math.atan2(-math.sin(yaw_rad), math.cos(yaw_rad))
+        rel      = math.atan2(math.sin(target_a - facing_a),
+                              math.cos(target_a - facing_a))
+        abs_rel  = abs(rel)
+
+        # Phase 1 — reward turning to face the checkpoint
+        # Full reward (2.0) when perfectly aligned, zero when facing away (π)
+        alignment_reward = (math.pi - abs_rel) / math.pi
+        reward += alignment_reward * 2.0
+
+        # Phase 2 — reward forward speed only when roughly aligned (<45°)
+        # Prevents agent being rewarded for fast movement in wrong direction
+        if abs_rel < math.pi / 4:
+            reward += speed * 3.0
+
+        # Checkpoint reached
+        if dist < self.checkpoint_threshold:
+            reward += 500.0
+            self.current_target_checkpoint_idx += 1
+            print(f"Checkpoint {self.current_target_checkpoint_idx} reached!")
+            if self.current_target_checkpoint_idx >= self.num_check_points:
+                reward += 500.0
+
+        # Distance shaping
+        if self.prev_dist is not None:
+            reward += (self.prev_dist - dist) * 5.0
+        self.prev_dist = dist
+
+        reward -= 0.1
+        return reward
+
+    def _get_observation(self, world_state=None):
+        if world_state is None:
+            world_state = self.agent_host.getWorldState()
+
+        if world_state.number_of_observations_since_last_state > 0:
+            raw = json.loads(world_state.observations[-1].text)
+            self.last_raw_obs = raw
+
+            x   = raw.get('XPos', 0.0)
+            z   = raw.get('ZPos', 0.0)
+            vx  = raw.get('XVel', 0.0)
+            vz  = raw.get('ZVel', 0.0)
+            yaw = raw.get('Yaw',  0.0)
+
+            # Try to get yaw from boat entity
+            for entity in raw.get('entities', []):
+                if entity.get('name') == 'Boat':
+                    yaw = entity.get('yaw', yaw)
+                    break
+
+            obs_vals = []
+            for i in range(3):
+                idx = self.current_target_checkpoint_idx + i
+                if idx < len(self.checkpoints):
+                    tx, tz = self.checkpoints[idx]
+                    obs_vals.extend([tx - x, tz - z])
+                else:
+                    obs_vals.extend([0.0, 0.0])
+
+            obs_vals.extend([vx, vz])
+
+            # Relative angle to next checkpoint as cos/sin
+            # Minecraft convention: yaw=0 → south (+Z), yaw=90 → west (-X)
+            # atan2(dx, dz) gives target angle in MC space (forward = +Z)
+            # facing angle = atan2(-sin(yaw_rad), cos(yaw_rad))
+            # positive rel = target is to the right, negative = to the left
+            if self.current_target_checkpoint_idx < len(self.checkpoints):
+                tx, tz   = self.checkpoints[self.current_target_checkpoint_idx]
+                dx_t     = tx - x
+                dz_t     = tz - z
+                yaw_rad  = math.radians(yaw)
+                target_a = math.atan2(dx_t, dz_t)
+                facing_a = math.atan2(-math.sin(yaw_rad), math.cos(yaw_rad))
+                rel      = math.atan2(math.sin(target_a - facing_a),
+                                      math.cos(target_a - facing_a))
+                obs_vals.extend([math.cos(rel), math.sin(rel)])
+            else:
+                obs_vals.extend([1.0, 0.0])
+
+            self.last_obs = np.array(obs_vals, dtype=np.float32)
+            return self.last_obs
+
+        # Fallback to last known obs
+        if self.last_raw_obs is not None:
+            x = self.last_raw_obs.get('XPos', 0)
+            z = self.last_raw_obs.get('ZPos', 0)
+            obs_vals = []
+            for i in range(3):
+                idx = self.current_target_checkpoint_idx + i
+                if idx < len(self.checkpoints):
+                    tx, tz = self.checkpoints[idx]
+                    obs_vals.extend([tx - x, tz - z])
+                else:
+                    obs_vals.extend([0.0, 0.0])
+            obs_vals.extend([0.0, 0.0, 1.0, 0.0])
+            return np.array(obs_vals, dtype=np.float32)
+
+        return np.zeros(10, dtype=np.float32)

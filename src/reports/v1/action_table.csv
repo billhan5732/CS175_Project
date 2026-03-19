@@ -1,0 +1,5 @@
+"Action [throttle, steer]",Name,Description
+"[0, 0]",Coast,"No throttle, no steer boat decelerates on ice"
+"[1, 0]",Forward,"Throttle on, straight ahead"
+"[1, 1]",Forward+Left,"Throttle on, steer left"
+"[1, 2]",Forward+Right,"Throttle on, steer right"

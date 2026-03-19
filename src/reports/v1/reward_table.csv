@@ -1,0 +1,12 @@
+Component,Min,Max,Condition,Purpose
+Lava penalty,-50,-50,YPos < 226.5,Terminal deterrent fall in lava
+Idle pressure,-1,0,Always (scaled based on time remaining),"Forces progress, prevents stationary farming"
+Alignment (moving),0,1.5,speed > 0.1,Rewards facing checkpoint while in motion
+Alignment (stationary),0,0.2,speed <= 0.1,Weak orientation signal at spawn
+Dwell bonus,0,1,"abs_rel > 30°, speed > 0.1",Rewards sustained alignment over twitching
+Steering correction,-3,3,abs_rel > 15°,Outcome-based: rewards abs_rel decreasing
+Edge penalty,? (negative),0,front_edge & speed > 0.3,Penalises charging at track edges
+Speed reward,0,2,"abs_rel < 45°, safe edge",Rewards forward motion when aligned
+Progress reward,0,?,delta_dist > 0,Rewards closing distance to checkpoint
+Checkpoint bonus,100,100,dist < 5 blocks,Sparse goal signal
+Lap complete,200,200,All checkpoints done,Terminal success signal

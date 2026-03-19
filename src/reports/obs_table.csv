@@ -1,0 +1,16 @@
+Index,Feature,Unit,Description
+0,Next checkpoint Δx,blocks,Signed offset to checkpoint 1
+1,Next checkpoint Δz,blocks,Signed offset to checkpoint 1
+2,Checkpoint+1 Δx,blocks,Look-ahead: checkpoint 2
+3,Checkpoint+1 Δz,blocks,Look-ahead: checkpoint 2
+4,Checkpoint+2 Δx,blocks,Look-ahead: checkpoint 3
+5,Checkpoint+2 Δz,blocks,Look-ahead: checkpoint 3
+6,Velocity x (vx),m/tick,East-West momentum
+7,Velocity z (vz),m/tick,North-South momentum
+8,Angular velocity,"[-1,1]",Yaw change/180 — spinout detection
+9,cos(rel angle to checkpoint),—,"1=aligned, -1=facing away"
+10,sin(rel angle to checkpoint),—,"+=target right, -=target left"
+11,Front edge sensor,binary,1=lava within 4 blocks ahead
+12,Right edge sensor,binary,1=lava within 4 blocks right
+13,Left edge sensor,binary,1=lava within 4 blocks left
+14,Behind edge sensor,binary,1=lava within 4 blocks behind
