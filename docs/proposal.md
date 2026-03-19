@@ -64,8 +64,8 @@ We will evaluate our agent using the following metrics:
 
 
 ## Meetings
-Jan 23rd, 2026 3:45pm - First meeting on zoom.  
-Feb 13rd, 2026 11:15am - Second meeting on zoom.  
+Jan 23rd, 2026 3:45pm - First meeting on zoom.
+Feb 13rd, 2026 11:15am - Second meeting on zoom.
 Mar 6th, 2026 10:15am - Third meeting on zoom.
 
 ## AI Tool Usage

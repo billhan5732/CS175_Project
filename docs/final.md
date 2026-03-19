@@ -5,6 +5,11 @@ title: Final Report
 
 
 # Video:
+https://youtu.be/XwhWx3wz9TM
+
+[![Video Title](https://img.youtube.com/vi/XwhWx3wz9TM/0.jpg)](https://youtu.be/XwhWx3wz9TM)
+
+
 
 
 # Final Model Repo:
