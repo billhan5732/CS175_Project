@@ -7,6 +7,10 @@ title: Final Report
 # Video:
 
 
+# Final Model Repo:
+https://github.com/billhan5732/CS175_Project/tree/tian_agent_testing
+
+
 # Project Summary:
 ## Motivation
 Minecraft’s boat physics, especially on ice, are notoriously finicky and sensitive thanks in part to balancing the extreme speeds this mode of transport is able to reach. Effectively moving and even racing for competition requires fine motor skills as well as technical knowledge of cornering strategies. This makes Boat Racing something fun and visualizable that an RL Agent would be perfectly adept for.
